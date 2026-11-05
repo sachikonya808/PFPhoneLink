@@ -1,24 +1,25 @@
-﻿using System;
+using System;
 using System.Numerics;
+using System.Threading.Tasks;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
 using Lumina.Excel.Sheets;
+using PFPhoneLink.Server;
 
-namespace SamplePlugin.Windows;
+namespace PFPhoneLink.Windows;
 
 public class MainWindow : Window, IDisposable
 {
-    private readonly string goatImagePath;
     private readonly Plugin plugin;
 
     // We give this window a hidden ID using ##.
     // The user will see "My Amazing Window" as window title,
     // but for ImGui the ID is "My Amazing Window##With a hidden ID"
-    public MainWindow(Plugin plugin, string goatImagePath)
-        : base("My Amazing Window##With a hidden ID", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
+    public MainWindow(Plugin plugin)
+        : base("PF Phone Link##With a hidden ID", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
     {
         SizeConstraints = new WindowSizeConstraints
         {
@@ -26,7 +27,6 @@ public class MainWindow : Window, IDisposable
             MaximumSize = new Vector2(float.MaxValue, float.MaxValue)
         };
 
-        this.goatImagePath = goatImagePath;
         this.plugin = plugin;
     }
 
@@ -34,7 +34,30 @@ public class MainWindow : Window, IDisposable
 
     public override void Draw()
     {
-        ImGui.Text($"The random config bool is {plugin.Configuration.SomePropertyToBeSavedAndWithADefault}");
+
+        ImGui.Text($"The Phone Link is {(plugin.IsActive ? "enabled on " + Helpers.getIPAddress() + ":" + plugin.Configuration.TcpPort : "disabled")}");
+
+        if (ImGui.Button("Start Server"))
+        {
+            if (plugin.IsActive == false) 
+            {
+                plugin.StartServer();
+            }
+        }
+
+        if (ImGui.Button("Stop Server"))
+        { 
+            plugin.ShutdownServer();
+        }
+
+        if (ImGui.Button("Send Message"))
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await plugin.SendPartyInfo(); }
+                catch (Exception ex) { Plugin.Log.Error(ex, "Failed to send packet"); }
+            });
+        }
 
         if (ImGui.Button("Show Settings"))
         {
@@ -51,22 +74,6 @@ public class MainWindow : Window, IDisposable
             // Check if this child is drawing
             if (child.Success)
             {
-                ImGui.Text("Have a goat:");
-                var goatImage = Plugin.TextureProvider.GetFromFile(goatImagePath).GetWrapOrDefault();
-                if (goatImage != null)
-                {
-                    using (ImRaii.PushIndent(55f))
-                    {
-                        ImGui.Image(goatImage.Handle, goatImage.Size);
-                    }
-                }
-                else
-                {
-                    ImGui.Text("Image not found.");
-                }
-
-                ImGuiHelpers.ScaledDummy(20.0f);
-
                 // Example for other services that Dalamud provides.
                 // PlayerState provides a wrapper filled with information about the player character.
 
