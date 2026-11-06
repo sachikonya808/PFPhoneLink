@@ -1,7 +1,6 @@
 using Dalamud.Game.Command;
 using Dalamud.IoC;
 using Dalamud.Plugin;
-using System.IO;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using PFPhoneLink.Windows;
@@ -12,9 +11,12 @@ using System.Threading;
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
-using Lumina.Excel.Sheets;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using Lumina;
+using Lumina.Excel.Sheets;
+using Dalamud.Game.Addon.Lifecycle;
+using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 
 namespace PFPhoneLink
 {
@@ -28,6 +30,7 @@ namespace PFPhoneLink
         [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
         [PluginService] internal static IPluginLog Log { get; private set; } = null!;
         [PluginService] internal static IFramework Framework { get; private set; } = null!;
+        [PluginService] internal static IAddonLifecycle AddonLifecycle { get; private set; } = null!;
 
         private const string OpenWindow = "/pflink";
         public bool IsActive => _notifyServer.isRunning;
@@ -40,21 +43,28 @@ namespace PFPhoneLink
 
         internal static GameData GameDataHelper { get; set; } = null!;
 
-        public record PartyMemberInfo(string Name, string Job, int Level);
-        public record PartyMessage(List<PartyMemberInfo> Members);
+        public record PartyMemberInfo(
+            string Name, 
+            string Job, 
+            int Level
+        );
+        public record PartyMessage(
+            List<PartyMemberInfo> Members,
+            string duty
+        );
 
         private NotifyServer _notifyServer { get; init; }
         private readonly CancellationTokenSource cToken = new();
         private Task? loopPacketRelay;
+
+        //Inacurrate
+        private string lastListingDuty = "???";
 
         public Plugin()
         {
             Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
             _notifyServer = new NotifyServer();
-
-            // You might normally want to embed resources and load them from the manifest stream
-            var goatImagePath = Path.Combine(PluginInterface.AssemblyLocation.Directory?.FullName!, "goat.png");
 
             ConfigWindow = new ConfigWindow(this);
             MainWindow = new MainWindow(this);
@@ -79,10 +89,8 @@ namespace PFPhoneLink
             // Adds another button doing the same but for the main ui of the plugin
             PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
 
-            // Add a simple message to the log with level set to information
-            // Use /xllog to open the log window in-game
-            // Example Output: 00:57:54.959 | INF | [SamplePlugin] ===A cool log message from Sample Plugin===
-            Log.Information($"===A cool log message from {PluginInterface.Manifest.Name}===");
+            //Code inspired by https://github.com/anomek/TomestoneViewer/blob/master/TomestoneViewer/GameSystems/TerritoryOfInterestDetector.cs
+            AddonLifecycle.RegisterListener(AddonEvent.PreFinalize, "LookingForGroupDetail", OnPfDetailClose);
         }
 
         public void Dispose()
@@ -108,6 +116,8 @@ namespace PFPhoneLink
             MainWindow.Dispose();
 
             CommandManager.RemoveHandler(OpenWindow);
+
+            AddonLifecycle.UnregisterListener(OnPfDetailClose);
         }
 
         private void OnStartCommand(string command, string args)
@@ -134,13 +144,10 @@ namespace PFPhoneLink
                 Log.Error(ex, $"Couldn't start server on port {Configuration.TcpPort}");
             }
         }
-
-        private static readonly JsonSerializerOptions JsonOptions =
-            new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
         
         public async Task SendJsonAsync<T>(T packet)
         {
-            var json = JsonSerializer.Serialize(packet, JsonOptions);
+            var json = JsonSerializer.Serialize(packet, Helpers.JsonOptions);
             await SendPacket(json);
         }
 
@@ -172,7 +179,8 @@ namespace PFPhoneLink
                         }
                         catch (Exception ex)
                         {
-                            Log.Error(ex, "Couldn't send data!");
+                            Log.Error(ex, "Couldn't send data! (Are you logged off?) Shutting down the server...");
+                            ShutdownServer();
                         }
                     }
                 }
@@ -186,17 +194,7 @@ namespace PFPhoneLink
             }
         }
 
-        private string GetJobAbbreviation(uint jobId) =>
-            DataManager.GetExcelSheet<ClassJob>().TryGetRow(jobId, out var sheet)
-            ? sheet.Abbreviation.ToString()
-            : "???";
-
-        private string GetWorldName(ushort worldID) =>
-            DataManager.GetExcelSheet<World>().TryGetRow(worldID, out var sheet)
-            ? sheet.Name.ToString() 
-            : "???";
-
-        private unsafe List<PartyMemberInfo> ReadParty()
+        private unsafe PartyMessage ReadParty()
         {
             var members = new List<PartyMemberInfo>();
 
@@ -210,24 +208,24 @@ namespace PFPhoneLink
                     members.Add(new PartyMemberInfo($"{m.NameString} @ {GetWorldName((ushort)m.HomeWorld)}", GetJobAbbreviation(m.ClassJobId), m.Level));
                 }
 
-                return members;
+                return new PartyMessage(members, lastListingDuty);
             }
 
-            return members;
+            return new PartyMessage(members, "");
         }
 
-        private List<PartyMemberInfo> ReadyPartyInfo()
+        private PartyMessage ReadyPartyInfo()
         {
             var members = ReadParty();
 
             var selfID = $"{PlayerState.CharacterName} @ {PlayerState.HomeWorld.Value.Name}";
-            var index = members.FindIndex(m => m.Name == selfID);
+            var index = members.Members.FindIndex(m => m.Name == selfID);
 
             if (index > 0)
             {
-                var self = members[index];
-                members.RemoveAt(index);
-                members.Insert(0, self);
+                var self = members.Members[index];
+                members.Members.RemoveAt(index);
+                members.Members.Insert(0, self);
             }
 
             return members;
@@ -236,9 +234,37 @@ namespace PFPhoneLink
         public async Task SendPartyInfo()
         {
             var message = await Framework.RunOnFrameworkThread(() =>
-                new PartyMessage(ReadyPartyInfo())
+                ReadyPartyInfo()
             );
             await SendJsonAsync(message);
+        }
+
+        private string GetJobAbbreviation(uint jobId) =>
+            DataManager.GetExcelSheet<ClassJob>().TryGetRow(jobId, out var sheet)
+            ? sheet.Abbreviation.ToString()
+            : "???";
+
+        private string GetWorldName(ushort worldID) =>
+            DataManager.GetExcelSheet<World>().TryGetRow(worldID, out var sheet)
+            ? sheet.Name.ToString()
+            : "???";
+
+        //Code inspired by https://github.com/anomek/TomestoneViewer/blob/master/TomestoneViewer/GameSystems/TerritoryOfInterestDetector.cs
+        private unsafe void OnPfDetailClose(AddonEvent type, AddonArgs addonArgs)
+        {
+            var addon = (AddonLookingForGroupDetail*)addonArgs.Addon.Address;
+            var duty = StripNonAsci(addon->DutyNameTextNode->NodeText.ToString());
+
+            lastListingDuty = duty;
+        }
+
+        private static string StripNonAsci(string text)
+        {
+            while (text.Length > 5 && text[0] == 2)
+            {
+                text = text[5..];
+            }
+            return text;
         }
     }
 }
