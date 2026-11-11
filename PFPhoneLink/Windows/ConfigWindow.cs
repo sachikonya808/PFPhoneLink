@@ -25,40 +25,20 @@ public class ConfigWindow : Window, IDisposable
 
     public void Dispose() { }
 
-    public override void PreDraw()
-    {
-        // Flags must be added or removed before Draw() is being called, or they won't apply
-        if (configuration.IsConfigWindowMovable)
-        {
-            Flags &= ~ImGuiWindowFlags.NoMove;
-        }
-        else
-        {
-            Flags |= ImGuiWindowFlags.NoMove;
-        }
-    }
-
     public override void Draw()
     {
+        // Can't ref a property, so use a local copy
         var tcpPort = configuration.TcpPort;
         if (ImGui.InputInt("TCP Port", ref tcpPort))
         {
             configuration.TcpPort = Math.Clamp(tcpPort, 1024, 49151);
+            // Can save immediately on change if you don't want to provide a "Save and Close" button
             configuration.Save();
         }
         var pushingRate = configuration.PushingRate;
         if (ImGui.InputInt("Pushing Rate", ref pushingRate))
         {
             configuration.PushingRate = Math.Clamp(pushingRate, 1, 69420);
-            configuration.Save();
-        }
-
-        // Can't ref a property, so use a local copy
-        var movable = configuration.IsConfigWindowMovable;
-        if (ImGui.Checkbox("Movable Config Window", ref movable))
-        {
-            configuration.IsConfigWindowMovable = movable;
-            // Can save immediately on change if you don't want to provide a "Save and Close" button
             configuration.Save();
         }
     }
