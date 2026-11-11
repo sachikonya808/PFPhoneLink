@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -10,17 +12,31 @@ namespace PFPhoneLink.Server
 {
     public class NotifyServer : IDisposable
     {
-        private TcpListener? _tcpListener;
-        private TcpClient? _tcpClient;
-        private CancellationTokenSource? _cts;
-        private readonly SemaphoreSlim _semaphore = new(1, 1);
-        private volatile bool _disposed;
+        //Device envelope
+        private sealed class Connection
+        {
+            public required TcpClient Client { get; init; }
+            public SemaphoreSlim SendLock { get; } = new SemaphoreSlim(1, 1); //One write at the time per device
+        }
 
-        public bool isRunning => _tcpListener != null;
-        public bool isConected => _tcpClient?.Connected == true;
+        //Storing every connected device
+        private readonly ConcurrentDictionary<Connection, byte> _connections= new ConcurrentDictionary<Connection, byte>();
+        
+        //Tcp server stuff
+        private TcpListener? _tcpListener;
+        private CancellationTokenSource? _cts;
+        private volatile bool _disposed;
+        
+        //Last message sent
+        private byte[]? _lastBytes;
+
+        public bool IsRunning => _tcpListener != null;
+        public int ConnectedCount => _connections.Count;
+        public bool IsConnected => !_connections.IsEmpty;
 
         public void Start(int port)
         {
+            //Send exception if trying to use object when already disposed
             ObjectDisposedException.ThrowIf(_disposed, this);
             Stop();
 
@@ -28,7 +44,6 @@ namespace PFPhoneLink.Server
             listener.Start();
 
             var cts = new CancellationTokenSource();
-
             _tcpListener = listener;
             _cts = cts;
 
@@ -40,15 +55,16 @@ namespace PFPhoneLink.Server
         {
             var cts = Interlocked.Exchange(ref _cts, null);
             var listener = Interlocked.Exchange(ref _tcpListener, null);
-            var client = Interlocked.Exchange(ref _tcpClient, null);
 
-            try 
-            {
-                cts?.Cancel();
-            }
-            catch { }
+            try { cts?.Cancel(); } catch { }
             listener?.Stop();
-            client?.Dispose();
+
+            foreach (var connection in _connections.Keys)
+            {
+                RemoveConnection(connection);
+            }
+
+            _lastBytes = null;
             cts?.Dispose();
         }
 
@@ -59,11 +75,15 @@ namespace PFPhoneLink.Server
                 while (!token.IsCancellationRequested)
                 {
                     var client = await listener.AcceptTcpClientAsync(token);
+                    client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
 
-                    var old = Interlocked.Exchange(ref _tcpClient, client);
-                    old?.Dispose();
+                    var connection = new Connection { Client = client };
+                    _connections[connection] = 0;
+                    Plugin.Log.Information($"Device Connected! (Current devices {_connections.Count})");
 
-                    Plugin.Log.Information("Device Connected!");
+                    //Immediately sync the new device
+                    var lastRelay = _lastBytes;
+                    if(lastRelay != null ) { _ = SyncDevicesAsync(connection, lastRelay); }
                 }
             }
             catch(OperationCanceledException)
@@ -89,30 +109,48 @@ namespace PFPhoneLink.Server
         {
             if (_disposed) return;
 
-            var client = _tcpClient;
+            var bytes = Encoding.UTF8.GetBytes(message + "\n");
+            _lastBytes = bytes;
 
-            if (client is not { Connected: true }) return; 
 
-            await _semaphore.WaitAsync();
+            var devices = _connections.Keys.ToArray();
+            if (devices.Length == 0) { return; }
+
+
+            await Task.WhenAll(devices.Select(c => SyncDevicesAsync(c, bytes)));
+        }
+
+        private async Task SyncDevicesAsync(Connection connection, byte[] bytes)
+        {
+            await connection.SendLock.WaitAsync();
+
             try
             {
-                var bytes = Encoding.UTF8.GetBytes(message + "\n");
-                await client.GetStream().WriteAsync(bytes);
+                //Wait 5 seconds for the device to respond
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await connection.Client.GetStream().WriteAsync(bytes, timeout.Token);
             }
-            catch(Exception ex) when (
-                ex is IOException ||
-                ex is SocketException ||
-                ex is ObjectDisposedException
-            )
+            catch (Exception ex) when (ex is 
+                IOException
+                or SocketException
+                or ObjectDisposedException
+                or InvalidOperationException
+                or OperationCanceledException
+            ) 
             {
-                client.Dispose();
-                Interlocked.CompareExchange(ref _tcpClient, null, client);
-                Plugin.Log.Information($"TCP Error: {ex.Message}");
+                //Kill if it doesn't respond
+                Plugin.Log.Information($"Device dropped: {ex.Message}");
+                RemoveConnection(connection);
             }
             finally
             {
-                _semaphore.Release();
+                connection.SendLock.Release();
             }
+        }
+
+        private void RemoveConnection(Connection connection)
+        {
+            if(_connections.TryRemove(connection, out _)) { connection.Client.Dispose(); }
         }
 
         public void Dispose()

@@ -13,7 +13,6 @@ using System.Collections.Generic;
 using System.Text.Json;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using FFXIVClientStructs.FFXIV.Client.UI;
-using Lumina;
 using Lumina.Excel.Sheets;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
@@ -23,9 +22,7 @@ namespace PFPhoneLink
     public sealed class Plugin : IDalamudPlugin
     {
         [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
-        [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
         [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
-        [PluginService] internal static IClientState ClientState { get; private set; } = null!;
         [PluginService] internal static IPlayerState PlayerState { get; private set; } = null!;
         [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
         [PluginService] internal static IPluginLog Log { get; private set; } = null!;
@@ -33,7 +30,7 @@ namespace PFPhoneLink
         [PluginService] internal static IAddonLifecycle AddonLifecycle { get; private set; } = null!;
 
         private const string OpenWindow = "/pflink";
-        public bool IsActive => _notifyServer.isRunning;
+        public bool IsActive => _notifyServer.IsRunning; //Ugly hack, too lazy to fix this
 
         public Configuration Configuration { get; init; }
 
@@ -41,14 +38,12 @@ namespace PFPhoneLink
         private ConfigWindow ConfigWindow { get; init; }
         private MainWindow MainWindow { get; init; }
 
-        internal static GameData GameDataHelper { get; set; } = null!;
-
         public record PartyMemberInfo(
             string Name, 
             string Job, 
             int Level
         );
-        public record PartyMessage(
+        public record PFMembersMessage(
             List<PartyMemberInfo> Members,
             string duty
         );
@@ -57,18 +52,19 @@ namespace PFPhoneLink
         private readonly CancellationTokenSource cToken = new();
         private Task? loopPacketRelay;
 
-        //Inacurrate
-        private string lastListingDuty = "???";
+        // ---------------- Plugin Setup ----------------
 
         public Plugin()
         {
             Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
+            //Loads the tcp server
             _notifyServer = new NotifyServer();
 
             ConfigWindow = new ConfigWindow(this);
             MainWindow = new MainWindow(this);
 
+            //Starts the loop that sends the data through the tcp server
             loopPacketRelay = RunLoopAsync(cToken.Token);
 
             WindowSystem.AddWindow(ConfigWindow);
@@ -89,7 +85,7 @@ namespace PFPhoneLink
             // Adds another button doing the same but for the main ui of the plugin
             PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
 
-            //Code inspired by https://github.com/anomek/TomestoneViewer/blob/master/TomestoneViewer/GameSystems/TerritoryOfInterestDetector.cs
+            //--- Code inspired by https://github.com/anomek/TomestoneViewer/blob/master/TomestoneViewer/GameSystems/TerritoryOfInterestDetector.cs ---
             AddonLifecycle.RegisterListener(AddonEvent.PreFinalize, "LookingForGroupDetail", OnPfDetailClose);
         }
 
@@ -128,6 +124,8 @@ namespace PFPhoneLink
         public void ToggleConfigUi() => ConfigWindow.Toggle();
         public void ToggleMainUi() => MainWindow.Toggle();
 
+        // ---------------- TCP Server ----------------
+
         public void StartServer()
         {
             if (IsActive)
@@ -144,7 +142,7 @@ namespace PFPhoneLink
                 Log.Error(ex, $"Couldn't start server on port {Configuration.TcpPort}");
             }
         }
-        
+
         public async Task SendJsonAsync<T>(T packet)
         {
             var json = JsonSerializer.Serialize(packet, Helpers.JsonOptions);
@@ -163,6 +161,21 @@ namespace PFPhoneLink
         {
             _notifyServer.Stop();
         }
+
+        // --- Code inspired by https://github.com/anomek/TomestoneViewer/blob/master/TomestoneViewer/GameSystems/TerritoryOfInterestDetector.cs ---
+
+        //Inaccurate due to how the Duty name is fetched
+        private string lastListingDuty = "???"; //Defaults to '???'
+
+        private unsafe void OnPfDetailClose(AddonEvent type, AddonArgs addonArgs)
+        {
+            var addon = (AddonLookingForGroupDetail*)addonArgs.Addon.Address;
+            var duty = Helpers.StripNonAsci(addon->DutyNameTextNode->NodeText.ToString());
+
+            lastListingDuty = duty;
+        }
+
+        // ---------------- Loop ----------------
 
         private async Task RunLoopAsync(CancellationToken cancellationToken)
         {
@@ -194,7 +207,9 @@ namespace PFPhoneLink
             }
         }
 
-        private unsafe PartyMessage ReadParty()
+        // ---------------- Creating the PF Packet ----------------
+
+        private unsafe PFMembersMessage ReadParty()
         {
             var members = new List<PartyMemberInfo>();
 
@@ -208,13 +223,15 @@ namespace PFPhoneLink
                     members.Add(new PartyMemberInfo($"{m.NameString} @ {GetWorldName((ushort)m.HomeWorld)}", GetJobAbbreviation(m.ClassJobId), m.Level));
                 }
 
-                return new PartyMessage(members, lastListingDuty);
+                return new PFMembersMessage(members, lastListingDuty);
             }
 
-            return new PartyMessage(members, "");
+            return new PFMembersMessage(members, "");
         }
-
-        private PartyMessage ReadyPartyInfo()
+        
+        //Sets (You) at the top of the party, that way the client can identify the user w/o having to
+        //fetch and send extra data (ugly hack I know)
+        private PFMembersMessage ReadyPartyInfo()
         {
             var members = ReadParty();
 
@@ -248,23 +265,5 @@ namespace PFPhoneLink
             DataManager.GetExcelSheet<World>().TryGetRow(worldID, out var sheet)
             ? sheet.Name.ToString()
             : "???";
-
-        //Code inspired by https://github.com/anomek/TomestoneViewer/blob/master/TomestoneViewer/GameSystems/TerritoryOfInterestDetector.cs
-        private unsafe void OnPfDetailClose(AddonEvent type, AddonArgs addonArgs)
-        {
-            var addon = (AddonLookingForGroupDetail*)addonArgs.Addon.Address;
-            var duty = StripNonAsci(addon->DutyNameTextNode->NodeText.ToString());
-
-            lastListingDuty = duty;
-        }
-
-        private static string StripNonAsci(string text)
-        {
-            while (text.Length > 5 && text[0] == 2)
-            {
-                text = text[5..];
-            }
-            return text;
-        }
     }
 }
