@@ -10,7 +10,7 @@ jobs:
     runs-on: windows-2022
 
     env:
-      Solution_Name: SamplePlugin
+      Solution_Name: PFPhoneLink
 
     steps:
     - name: Checkout
@@ -32,8 +32,8 @@ jobs:
     - name: Store artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: SamplePlugin
-        path: .\SamplePlugin\bin\x64\Release\SamplePlugin\*
+        name: PFPhoneLink
+        path: .\PFPhoneLink\bin\x64\Release\PFPhoneLink\*
         if-no-files-found: error
         retention-days: 1
 
